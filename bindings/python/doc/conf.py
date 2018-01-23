@@ -1,3 +1,5 @@
+import re
+
 try:
     import cntk
 except ImportError:
@@ -11,7 +13,7 @@ try:
 except ImportError:
     raise ImportError("Unable to import sphinx_rtd_theme, please install via "
                       "'pip install sphinx_rtd_theme'")
-
+                      
 extensions = [
     'sphinx.ext.autodoc',
     'sphinx.ext.extlinks',
@@ -19,19 +21,29 @@ extensions = [
     'sphinx.ext.napoleon',
     'sphinx.ext.todo',
     'sphinx.ext.viewcode',
+    'nbsphinx',
+    'IPython.sphinxext.ipython_console_highlighting'
 ]
+
+# Suppress warnings
+suppress_warnings = ['image.nonlocal_uri']
+
+# Define source suffix
+source_suffix = ['.rst', '.ipynb']
 
 master_doc = 'index'
 
 exclude_patterns = [
     '_build',
-    'cntk_py',
-    'tests',
-    '**/tests/*',
-    '*tests*'
+    'images',
+    'test',
 ]
 
-needs_sphinx = '1.3'
+autodoc_mock_imports = [
+    'tensorflow',
+]
+
+needs_sphinx = '1.5'
 
 # TODO nitpick_ignore
 
@@ -52,18 +64,35 @@ add_module_names = False
 html_theme = "sphinx_rtd_theme"
 html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
 
+# Linkcheck builder options
+def re_exact_match(s):
+  return re.compile('^' + re.escape(s) + '$')
+
+linkcheck_anchors_ignore = [
+  # Important: Github Wiki anchors (for sections refs) yield errors in
+  # link-checking and need to be manually checked. Current exception to make
+  # the build pass are listed here:
+  re_exact_match('21-data-parallel-training-with-1-bit-sgd'),
+  re_exact_match('22-block-momentum-sgd'),
+  re_exact_match('converting-learning-rate-and-momentum-parameters-from-other-toolkits'),
+  re_exact_match('for-python'),
+  re_exact_match('base64imagedeserializer-options'),
+]
+
 source_prefix = 'https://github.com/Microsoft/CNTK/blob/'
 if module_is_unreleased():
-    # TODO temporary
-    source_prefix += 'v%s' % (cntk.__version__[:-1].replace("rc", ".rc"))
-else:
     source_prefix += 'master'
+else:
+    # TODO temporary
+    source_prefix += 'v%s' % (cntk.__version__.replace("rc", ".rc"))
 
 # sphinx.ext.extlinks options
 extlinks = {
     'cntk': (source_prefix + '/%s', ''),
     'cntktut': (source_prefix + '/Tutorials/%s.ipynb', ''),
-    'cntkwiki': ('https://github.com/Microsoft/CNTK/wiki/%s', 'CNTK Wiki - ')
+    # CNTK Wiki has moved to a new site:
+    'cntkwiki': ('https://docs.microsoft.com/en-us/cognitive-toolkit/%s', 'CNTK Doc - '),
+    'cntkman': (source_prefix + '/Manual/%s.ipynb', ''),
 }
 
 # sphinx.ext.napoleon options

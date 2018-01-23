@@ -134,6 +134,7 @@ static inline void Warning(const char* format, ...)
 
     va_start(args, format);
     vsprintf(buffer, format, args);
+    va_end(args);
 };
 #pragma warning(pop)
 static inline void Warning(const string& message)
@@ -150,6 +151,11 @@ static inline void Warning(const string& message)
     \
 }
 #endif
+
+
+// Computes the smallest multiple of k greater or equal to n
+inline size_t AsMultipleOf(size_t n, size_t k) { return n + (k - n % k) % k; }
+
 }}}
 
 #ifndef _MSC_VER
@@ -213,6 +219,7 @@ struct _strprintf : public std::basic_string<_T>
             std::vector<_T> varbuf(n + 1); // incl. '\0'
             this->assign(_sprintf(&varbuf[0], varbuf.size(), format, args), n);
         }
+        va_end(args);
     }
 
 private:
@@ -220,7 +227,7 @@ private:
     inline size_t _cprintf(const wchar_t* format, va_list args)
     {
 #ifdef _MSC_VER
-        return vswprintf(nullptr, 0, format, args);
+        return _vscwprintf(format, args);
 #elif defined(__UNIX__)
         // TODO: Really??? Write to file in order to know the length of a string?
         FILE* dummyf = fopen("/dev/null", "w");
@@ -289,7 +296,7 @@ struct utf8 : std::string
         }                                   // empty string
         std::vector<char> buf(3 * len + 1); // max: 1 wchar => up to 3 mb chars
         // ... TODO: this fill() should be unnecessary (a 0 is appended)--but verify
-        std::fill(buf.begin(), buf.end(), 0);
+        std::fill(buf.begin(), buf.end(), (char)0);
         int rc = WideCharToMultiByte(CP_UTF8, 0, p.c_str(), (int) len,
                                      &buf[0], (int) buf.size(), NULL, NULL);
         if (rc == 0)
@@ -328,7 +335,7 @@ static inline std::string wcstombs(const std::wstring& p) // output: MBCS
 {
     size_t len = p.length();
     std::vector<char> buf(2 * len + 1); // max: 1 wchar => 2 mb chars
-    std::fill(buf.begin(), buf.end(), 0);
+    std::fill(buf.begin(), buf.end(), (char)0);
     ::wcstombs(&buf[0], p.c_str(), 2 * len + 1);
     return std::string(&buf[0]);
 }
@@ -676,9 +683,9 @@ public:
     {
     }
     template <class STRING> // accepts char (UTF-8) and wide string
-    FARPROC Load(const STRING& plugin, const std::string& proc)
+    FARPROC Load(const STRING& plugin, const std::string& proc, bool isCNTKPlugin = true)
     {
-        return LoadInternal(msra::strfun::utf16(plugin), proc);
+        return LoadInternal(msra::strfun::utf16(plugin), proc, isCNTKPlugin);
     }
     ~Plugin()
     {
@@ -687,7 +694,7 @@ public:
     // ~Plugin() { if (m_hModule) FreeLibrary(m_hModule); }
 
 private:
-    FARPROC LoadInternal(const std::wstring& plugin, const std::string& proc);
+    FARPROC LoadInternal(const std::wstring& plugin, const std::string& proc, bool isCNTKPlugin);
 };
 #else
 class Plugin
@@ -701,9 +708,9 @@ public:
     {
     }
     template <class STRING> // accepts char (UTF-8) and wide string
-    void *Load(const STRING& plugin, const std::string& proc)
+    void *Load(const STRING& plugin, const std::string& proc, bool isCNTKPlugin = true)
     {
-        return LoadInternal(msra::strfun::utf8(plugin), proc);
+        return LoadInternal(msra::strfun::utf8(plugin), proc, isCNTKPlugin);
     }
     ~Plugin()
     {
@@ -718,7 +725,7 @@ public:
     }
 
 private:
-    void *LoadInternal(const std::string& plugin, const std::string& proc);
+    void *LoadInternal(const std::string& plugin, const std::string& proc, bool isCNTKPlugin);
 };
 #endif
 

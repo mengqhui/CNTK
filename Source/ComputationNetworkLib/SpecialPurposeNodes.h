@@ -8,6 +8,8 @@
 #include "ComputationNode.h"
 #include "gammacalculation.h"
 #include "NonlinearityNodes.h"
+#include "latticearchive.h"
+#include "ProgressTracing.h"
 
 #include <map>
 #include <string>
@@ -458,7 +460,7 @@ public:
     {
     }
 
-    // compute gradients to input observations, the weights to the observations, and the class log posterior probabilites
+    // compute gradients to input observations, the weights to the observations, and the class log posterior probabilities
     virtual void BackpropToNonLooping(size_t inputIndex) override
     {
         // auto t_start_time = Timer::MilliSecondElapsed();
@@ -542,6 +544,7 @@ public:
             m_gammaCalculator.init(m_hmm, m_deviceId);
             m_gammaCalcInitialized = true;
         }
+
         // softmax
         m_logSoftmaxOfRight->AssignLogSoftmaxOf(Input(1)->Value() /*prediction*/, true);
         m_softmaxOfRight->SetValue(*m_logSoftmaxOfRight);
@@ -574,8 +577,7 @@ public:
             if (!(Input(0)->GetSampleMatrixNumRows() == Input(1)->GetSampleMatrixNumRows() && // match size
                   Input(1)->GetSampleMatrixNumRows() == Input(2)->GetSampleMatrixNumRows() &&
                   Input(0)->HasMBLayout() &&
-                  Input(0)->GetMBLayout() == Input(1)->GetMBLayout() &&
-                  Input(0)->GetMBLayout() == Input(2)->GetMBLayout()))
+                  Input(0)->GetMBLayout() == Input(1)->GetMBLayout())) 
             {
                 LogicError("The Matrix dimension in the SequenceWithSoftmaxNode operation does not match.");
             }
@@ -659,7 +661,7 @@ protected:
     double m_seqGammarLMF;
     double m_seqGammarWP;
     double m_seqGammarbMMIFactor;
-    double m_seqGammarUsesMBR;
+    bool m_seqGammarUsesMBR;
     bool m_doReferenceAlignment;
     std::vector<shared_ptr<const msra::dbn::latticepair>> m_lattices;
     msra::asr::simplesenonehmm m_hmm;
@@ -675,6 +677,221 @@ protected:
 
 template class SequenceWithSoftmaxNode<float>;
 template class SequenceWithSoftmaxNode<double>;
+
+// -----------------------------------------------------------------------
+// LatticeSequenceWithSoftmaxNode (label, prediction, loglikelihood, lattice)
+// Similar to the SequenceWithSoftmaxNode, but is using the new deserializer.
+//
+// -----------------------------------------------------------------------
+
+template <class ElemType>
+class LatticeSequenceWithSoftmaxNode : public SequenceWithSoftmaxNode<ElemType>, public NumInputs<4>
+{
+    typedef ComputationNodeNonLooping<ElemType> Base;
+    UsingComputationNodeMembersBoilerplate;
+    static const std::wstring TypeName()
+    {
+        return L"LatticeSequenceWithSoftmax";
+    }
+
+public:
+    LatticeSequenceWithSoftmaxNode(DEVICEID_TYPE deviceId, const std::wstring& name, const std::wstring& symListPath, const std::wstring& phonePath, const std::wstring& stateListPath, const std::wstring& transProbPath,
+        float hSmoothingWeight, float frameDropThresh, bool doReferenceAlign, bool seqGammarUsesMBR, float seqGammarAMF, float seqGammarLMF, float seqGammarBMMIFactor, float seqGammarWordPen)
+        : SequenceWithSoftmaxNode<ElemType>(deviceId, name), m_symListPath(symListPath), m_phonePath(phonePath), m_stateListPath(stateListPath), m_transProbPath(transProbPath)
+    {
+        if (sizeof(ElemType) != sizeof(float))
+            LogicError("LatticeSequenceWithSoftmaxNode currently only supports floats.\n"); // due to the binary reader restrictions 
+
+        if (symListPath.size() == 0 || phonePath.size() == 0 || stateListPath.size() == 0 || transProbPath.size() == 0)
+            LogicError("Ensure that symListPath, phonePath, stateListPath and transProbPath parameters are specified.\n");
+        
+        InitSEParams(symListPath, phonePath, stateListPath, transProbPath);
+        this->m_fsSmoothingWeight = hSmoothingWeight;
+        this->m_frameDropThreshold = frameDropThresh;
+        this->m_doReferenceAlignment = doReferenceAlign;
+        this->m_seqGammarUsesMBR = seqGammarUsesMBR;
+        this->m_seqGammarAMF = seqGammarAMF;
+        this->m_seqGammarLMF = seqGammarLMF;
+        this->m_seqGammarbMMIFactor = seqGammarBMMIFactor;
+        this->m_seqGammarWP = seqGammarWordPen;
+
+        this->SetGammarCalculationParam(seqGammarAMF, seqGammarLMF, seqGammarWordPen, seqGammarBMMIFactor, seqGammarUsesMBR);
+    }
+
+    LatticeSequenceWithSoftmaxNode(DEVICEID_TYPE deviceId, const std::wstring& name)
+        : SequenceWithSoftmaxNode<ElemType>(deviceId, name)
+    {
+    }
+
+    LatticeSequenceWithSoftmaxNode(const ScriptableObjects::IConfigRecordPtr configp)
+        : LatticeSequenceWithSoftmaxNode(configp->Get(L"deviceId"), L"<placeholder>", configp->Get(L"symListPath"), configp->Get(L"phonePath"), configp->Get(L"stateListPath"), configp->Get(L"transProbPath"),
+            configp->Get(L"hSmoothingWeight"), configp->Get(L"frameDropThresh"), configp->Get(L"doReferenceAlign"), configp->Get(L"seqGammarUsesMBR"), configp->Get(L"seqGammarAMF"), configp->Get(L"seqGammarLMF"), configp->Get(L"seqGammarBMMIFactor"), configp->Get(L"seqGammarWordPen")
+        )
+    {
+        AttachInputsFromConfig(configp, 4);
+    }
+
+    // compute gradients to input observations, the weights to the observations, and the class log posterior probabilities
+    virtual void BackpropToNonLooping(size_t inputIndex) override
+    {
+        SequenceWithSoftmaxNode<ElemType>::BackpropToNonLooping(inputIndex);
+    }
+
+    // -sum(left_i * log(softmax_i(right)))
+    virtual void ForwardPropNonLooping()
+    {
+        this->m_lattices.clear();
+        this->m_uids.clear();
+        this->m_boundaries.clear();
+        this->m_extraUttMap.clear();
+
+        if (InputRef(3).ValuePtrRef()->GetDeviceId() != CPUDEVICE)
+            LogicError("Due to their size, lattices should be allocated on CPU memory");
+
+        const char* bufferStart = reinterpret_cast<char*>(InputRef(3).ValuePtrRef()->Data());
+
+        let& labelMBLayout = InputRef(0).GetMBLayout();
+        const auto& labelSequences = labelMBLayout->GetAllSequences();
+
+        let& latticeMBLayout = InputRef(3).GetMBLayout();
+        size_t latticeMBNumTimeSteps = latticeMBLayout->GetNumTimeSteps();
+
+        InputRef(0).ValuePtrRef()->VectorMax(*m_maxIndexes, *m_maxValues, true);
+        for (size_t i = 0; i < labelSequences.size(); i++)
+        {
+            if (labelSequences[i].seqId == GAP_SEQUENCE_ID)
+                continue;
+
+            auto& currentLabelSeq = labelSequences[i];
+
+            // Fill up labels
+            auto columnIndices = labelMBLayout->GetColumnIndices(currentLabelSeq);
+
+            for (size_t ci = 0; ci < columnIndices.size(); ci++)
+            {
+                size_t refId = (int)(*m_maxIndexes)(0, columnIndices[ci]);
+                this->m_uids.push_back(refId);
+            }
+            this->m_extraUttMap.push_back(labelSequences[i].s);
+        }
+
+        this->m_lattices.resize(labelMBLayout->GetNumSequences());
+        size_t nonZeroSeqCount = 0;
+//#pragma omp parallel for TODO: test this in philly and enable if performance is good.
+        for (long i = 0; i < labelSequences.size(); i++)
+        {
+            if (labelSequences[i].seqId == GAP_SEQUENCE_ID)
+                continue;
+
+            auto& currentLabelSeq = labelSequences[i];
+
+            // Fill up lattice
+            auto& currentLatticeSeq = latticeMBLayout->FindSequence(currentLabelSeq.seqId);
+            std::shared_ptr<msra::dbn::latticepair> latticePair(new msra::dbn::latticepair);
+            const char* buffer = bufferStart + latticeMBNumTimeSteps * sizeof(float) * currentLatticeSeq.s + currentLatticeSeq.tBegin;
+            latticePair->second.ReadFromBuffer(buffer, m_idmap, m_idmap.back());
+            assert((currentLabelSeq.tEnd - currentLabelSeq.tBegin) == latticePair->second.info.numframes);
+            this->m_lattices[nonZeroSeqCount] = latticePair;
+            nonZeroSeqCount++;
+        }
+        this->m_boundaries.resize(this->m_uids.size());
+        std::fill(this->m_boundaries.begin(), this->m_boundaries.end(), 0);
+        SequenceWithSoftmaxNode<ElemType>::ForwardPropNonLooping();
+    }
+
+    virtual void Save(File& fstream) const override
+    {
+        Base::Save(fstream);
+        fstream << m_symListPath;
+        fstream << m_phonePath;
+        fstream << m_stateListPath;
+        fstream << m_transProbPath;
+        fstream << this->m_frameDropThreshold;
+        fstream << this->m_fsSmoothingWeight;
+        fstream << this->m_seqGammarAMF;
+        fstream << this->m_seqGammarLMF;
+        fstream << this->m_seqGammarWP;
+        fstream << this->m_seqGammarbMMIFactor;
+        fstream << this->m_seqGammarUsesMBR;
+        fstream << this->m_doReferenceAlignment;
+    }
+
+    virtual void Load(File& fstream, size_t modelVersion) override
+    {
+        Base::Load(fstream, modelVersion);
+        fstream >> m_symListPath;
+        fstream >> m_phonePath;
+        fstream >> m_stateListPath;
+        fstream >> m_transProbPath;
+        fstream >> this->m_frameDropThreshold;
+        fstream >> this->m_fsSmoothingWeight;
+        fstream >> this->m_seqGammarAMF;
+        fstream >> this->m_seqGammarLMF;
+        fstream >> this->m_seqGammarWP;
+        fstream >> this->m_seqGammarbMMIFactor;
+        fstream >> this->m_seqGammarUsesMBR;
+        fstream >> this->m_doReferenceAlignment;
+        InitSEParams(m_symListPath, m_phonePath, m_stateListPath, m_transProbPath);
+        this->SetGammarCalculationParam(this->m_seqGammarAMF, this->m_seqGammarLMF, this->m_seqGammarWP, this->m_seqGammarbMMIFactor, this->m_seqGammarUsesMBR);
+    }
+
+    virtual void /*ComputationNodeBase::*/ Validate(bool isFinalValidationPass) override
+    {
+        SequenceWithSoftmaxNode<ElemType>::Validate(isFinalValidationPass);
+
+        if (isFinalValidationPass)
+        {
+            // Make sure lattices are pre allocated on CPU, due to their size.
+            Input(3)->ValuePtrRef()->TransferToDeviceIfNotThere(CPUDEVICE, true /*moving completely*/, true /*preserving no data*/);
+        }
+    }
+
+    virtual void CopyTo(ComputationNodeBasePtr nodeP, const std::wstring& newName, const CopyNodeFlags flags) const override
+    {
+        SequenceWithSoftmaxNode<ElemType>::CopyTo(nodeP, newName, flags);
+
+        if (flags & CopyNodeFlags::copyNodeValue)
+        {
+            auto node = dynamic_pointer_cast<LatticeSequenceWithSoftmaxNode<ElemType>>(nodeP);
+
+            if (node) 
+            {
+                node->m_idmap = m_idmap;
+                node->m_symListPath = m_symListPath;
+                node->m_phonePath = m_phonePath;
+                node->m_stateListPath = m_stateListPath;
+                node->m_stateListPath = m_transProbPath;
+            }
+        }
+    }
+
+    // request matrices needed to do node function value evaluation
+    virtual void RequestMatricesBeforeForwardProp(MatrixPool& matrixPool)
+    {
+        SequenceWithSoftmaxNode<ElemType>::RequestMatricesBeforeForwardProp(matrixPool);
+        RequestMatrixFromPool(m_maxIndexes, matrixPool);
+        RequestMatrixFromPool(m_maxValues, matrixPool);
+    }
+
+private: 
+    msra::lattices::archive::symbolidmapping m_idmap;
+    std::wstring m_symListPath;
+    std::wstring m_phonePath;
+    std::wstring m_stateListPath;
+    std::wstring m_transProbPath;
+    shared_ptr<Matrix<ElemType>> m_maxIndexes, m_maxValues;
+
+    void InitSEParams(const std::wstring& symListPath, const std::wstring& phonePath, const std::wstring& stateListPath, const std::wstring& transProbPath) 
+    {
+        LOGPRINTF(stderr, "Reading files\n %ls \n %ls \n %ls \n %ls \n", symListPath.c_str(), phonePath.c_str(), stateListPath.c_str(), transProbPath.c_str());
+        this->m_hmm.loadfromfile(phonePath, stateListPath, transProbPath);
+        auto symmap = this->m_hmm.getsymmap();
+        msra::lattices::archive::GetSymList(m_idmap, symListPath, symmap);
+    }
+};
+
+template class LatticeSequenceWithSoftmaxNode<float>;
+template class LatticeSequenceWithSoftmaxNode<double>;
 
 // -----------------------------------------------------------------------
 // DummyCriterionNode (objectiveValues, userSuppliedGradient, prediction)
@@ -795,7 +1012,7 @@ public:
         AttachInputsFromConfig(configp, this->GetExpectedNumInputs());
     }
 
-    // Compute gradients to input observations, the weights to the observations, and the class log posterior probabilites
+    // Compute gradients to input observations, the weights to the observations, and the class log posterior probabilities
     virtual void BackpropToNonLooping(size_t inputIndex) override
     {
         // Left node must be a scalar
@@ -892,7 +1109,7 @@ public:
                 LogicError("ForwardBackwardNode: Please pass LabelsToGraph(labels) for second argument");
         }
 
-        SetDims(TensorShape(1), false);
+        SetDims(TensorShape::Scalar(Environment().IsV2Library()), false);
     }
 
     virtual void CopyTo(const ComputationNodePtr nodeP, const std::wstring& newName, const CopyNodeFlags flags) const
@@ -1012,4 +1229,141 @@ public:
 
 template class StopGradientNode<float>;
 template class StopGradientNode<double>;
+
+// -----------------------------------------------------------------------
+// AssignNode (RefInput, Input)
+// -----------------------------------------------------------------------
+template <class ElemType>
+class AssignNode : public ComputationNodeNonLooping /*ComputationNode*/<ElemType>, public NumInputs<2>
+{
+    typedef ComputationNodeNonLooping<ElemType> Base; UsingComputationNodeMembersBoilerplate;
+    static const std::wstring TypeName() { return L"Assign"; }
+
+    shared_ptr<Matrix<ElemType>> m_result;
+
+public:
+    DeclareConstructorFromConfigWithNumInputs(AssignNode);
+    AssignNode(DEVICEID_TYPE deviceId, const wstring& name)
+        : Base(deviceId, name)
+    {
+    }
+
+    virtual void UpdateFunctionMBSize() override
+    {
+        m_result->Resize(Input(0)->Value());
+    }
+
+    virtual void /*ComputationNodeNonLooping::*/ ForwardPropNonLooping() override
+    {
+        auto& result = Value();
+        auto& inputValue = InputRef(1).Value();
+
+        if (inputValue.GetNumElements() != result.GetNumElements())
+        {
+            InvalidArgument("%ls %ls operation: unexpected dimension mismatch", NodeName().c_str(), OperationName().c_str());
+        }
+
+        m_result->AssignValuesOf(inputValue);
+        result.AssignValuesOf(inputValue);
+    }
+
+    virtual void /*ComputationNodeNonLooping::*/ PostForwardAndBackProp() override
+    {
+        auto& refValue = InputRef(0).Value();
+        refValue.AssignValuesOf(*m_result);
+
+        // We update Input(0) so bump the timestamp for the new data.
+        Input(0)->BumpEvalTimeStamp();
+    }
+
+    virtual void BackpropToNonLooping(size_t inputIndex) override
+    {
+        if (inputIndex == 1)
+            Input(1)->Gradient() += Gradient();
+    }
+
+    virtual void /*ComputationNodeBase::*/ Validate(bool isFinalValidationPass) override
+    {
+        ValidateBinaryZip(isFinalValidationPass, false);
+
+        if (Input(0)->HasMBLayout() || Input(1)->HasMBLayout())
+            InvalidArgument("AssignNode: None of the inputs can have dynamic axes.");
+        //only check layout in final pass, as there may be free dimension axis
+        if (isFinalValidationPass && Input(0)->GetSampleLayout() != Input(1)->GetSampleLayout())
+            InvalidArgument("AssignNode: All inputs should have same sample layout.");
+    }
+
+    // request matrices needed to do node function value evaluation
+    virtual void RequestMatricesBeforeForwardProp(MatrixPool& matrixPool)
+    {
+        Base::RequestMatricesBeforeForwardProp(matrixPool);
+        RequestMatrixFromPool(m_result, matrixPool);
+    }
+
+    virtual bool OutputUsedInComputingInputNodesGradients() const override { return false; }
+    virtual bool InputUsedInComputingInputNodesGradients(size_t /*childIndex*/) const override { return false; }
+};
+
+template class AssignNode<float>;
+template class AssignNode<double>;
+
+// -----------------------------------------------------------------------
+// OutputMultiplexerNode(userDefinedV2FunctionNode, outputIndex)
+// ComputationNode for selecting one of the multiple outputs of UserDefinedV2FunctionNode
+// This is needed since the CNTK computation engin natively does not support
+// nodes with multiple outputs and hence, we need a separate node to multiplex 
+// the additional outputs.
+// -----------------------------------------------------------------------
+
+// TODO: We currently only support external nodes that cannot be part of CNTK recurrent loops
+template <class ElemType>
+class OutputMultiplexerNode final : public ComputationNodeNonLooping<ElemType>, public NumInputs<1>
+{
+    typedef ComputationNodeNonLooping<ElemType> Base; UsingComputationNodeMembersBoilerplate;
+    static const std::wstring TypeName() { return L"OutputMultiplexer"; }
+
+public:
+    OutputMultiplexerNode(DEVICEID_TYPE deviceId, const wstring& name, size_t outputIndex = 0)
+        : Base(deviceId, name), m_outputIndex(outputIndex)
+    {
+        if (outputIndex == 0)
+            LogicError("OutputMultiplexerNode ctor must not be instantiated with outputIndex == 0");
+    }
+
+    virtual void ForwardPropNonLooping() override
+    {
+        // TODO: We should avoid this copy but that requires carefully managing the 
+        // lifetimes of the Value objects since to be able to directly use the 
+        // input Value as its output, we have to make sure that the input's Value
+        // is not reused until all dependents of this node are finished.
+        auto inputNode = Input(0)->template As<MultiOutputNode<ElemType>>();
+        Value().AssignValuesOf(*inputNode->m_outputsValue[m_outputIndex]);
+    }
+
+    virtual void BackpropToNonLooping(size_t inputIndex) override
+    {
+        // TODO: We should avoid this copy but that requires carefully managing the 
+        // lifetimes of the Gradient objects since to be able to directly use the 
+        // Gradient as input's gradient, we have to make sure that the Gradient
+        // is not reused until all the inputs are finished backpropagating to their inputs.
+        auto inputNode = Input(0)->template As<MultiOutputNode<ElemType>>();
+        inputNode->m_outputsGradient[m_outputIndex]->SetValue(Gradient());
+    }
+
+    virtual void Validate(bool isFinalValidationPass) override
+    {
+        Base::Validate(isFinalValidationPass);
+
+        auto inputNode = Input(0)->template As<MultiOutputNode<ElemType>>();
+        m_pMBLayout = inputNode->m_outputsMBLayout[m_outputIndex];
+        SetDims(inputNode->m_outputsShape[m_outputIndex], HasMBLayout());
+    }
+
+private:
+    size_t m_outputIndex;
+};
+
+template class OutputMultiplexerNode<float>;
+template class OutputMultiplexerNode<double>;
+
 } } }

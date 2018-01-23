@@ -16,11 +16,47 @@
 
 namespace Microsoft { namespace MSR { namespace CNTK {
 
-using namespace std;
+    using namespace std;
 
 // -----------------------------------------------------------------------
 // subroutines for evaluation
 // -----------------------------------------------------------------------
+// lazy resetting of gradient
+// This performs the actual zeroing out.
+template<class ElemType>
+void ComputationNode<ElemType>::LazyZeroGradient(const ComputationNodeBase* gradientInitializedBy)
+{
+    if (!m_needsGradient)
+        LogicError("%ls %ls operation: LazyZeroGradient() called although this node needs no gradient.", NodeName().c_str(), OperationName().c_str());
+
+    if (gradientInitializedBy == nullptr)
+        LogicError("%ls %ls operation: LazyZeroGradient() called without gradientInitializedBy.", NodeName().c_str(), OperationName().c_str());
+
+    if (m_gradientInitializedBy != nullptr)
+        return;
+
+    // gradient optimization to allow parent to overwrite/be reused by non-looping child's gradient instead of accumulating
+    // We cannot enable the gradient overwrite/reuse optimization if this node's parent
+    // has this same node as multiple of its inputs since, in that case the
+    // gradients will flow back from multiple paths of the same parent into the input
+    // nor can we apply gradient optimization for nodes in loop as the gradient needs to be accumulated through time steps
+
+    const auto& inputs = gradientInitializedBy->GetInputs();
+
+    if (Globals::ShouldOptimizeGradientAccumulation() &&
+        !IsPartOfLoop() &&
+        gradientInitializedBy->ImplementsGradientOptimization(this) != ParentGradientOptimization::None &&
+        1 == std::count_if(inputs.begin(), inputs.end(), [this](ComputationNodeBasePtr p) { return &*p == this; }))
+    {
+        UpdateDataSize(Gradient(), ParentGradientReused());
+        m_gradientInitializedBy = gradientInitializedBy;
+    }
+    else
+    {
+        UpdateDataSize(Gradient());
+        ResetGradient(0);
+    }
+}
 
 template<class ElemType>
 void ComputationNode<ElemType>::Backprop(const FrameRange& fr, bool childrenInThisLoop, bool childrenInOuterLoop) /*override*/
@@ -41,7 +77,7 @@ void ComputationNode<ElemType>::Backprop(const FrameRange& fr, bool childrenInTh
     }
 #endif
     if (m_needsGradient)
-        LazyZeroGradient(); // set gradient to 0 if this is the first time
+        LazyZeroGradient(this); // set gradient to 0 if this is the first time
 #endif
 
     if (fr.IsAllFrames() && IsPartOfLoop() && childrenInThisLoop)
@@ -49,18 +85,18 @@ void ComputationNode<ElemType>::Backprop(const FrameRange& fr, bool childrenInTh
 
     for (size_t i = 0; i < m_inputs.size(); i++)
     {
-        ComputationNodePtr child = Input(i);
-        if (child->m_needsGradient &&
+        ComputationNodeBasePtr child = m_inputs[i];
+        if (child->NeedsGradient() &&
             ((childrenInThisLoop  && child->IsPartOfLoop() == IsPartOfLoop()) ||
              (childrenInOuterLoop && child->IsPartOfLoop() != IsPartOfLoop()) ))
         {
             // fprintf(stderr, "Backprop: %ls %ls operation -> child %d %ls %ls\n", NodeName().c_str(), OperationName().c_str(), (int)i, child->NodeName().c_str(), child->OperationName().c_str());
-            if (!m_needsGradient)
+            if (!NeedsGradient())
                 LogicError("%ls %ls operation has m_needsGradient set to false but children require it.", NodeName().c_str(), OperationName().c_str());
 #if DUMPOUTPUT
             fprintf(stderr, "Backprop%d_%ls\n", i, NodeName().c_str());
 #endif
-            child->LazyZeroGradient(); // set gradient to 0 if this is the first time
+            SMART_NODE_INVOKE(ComputationNode, child, LazyZeroGradient, this); // set gradient to 0 if this is the first time
 
             // If we propagate from a loop to a node that is outside the loop, we are not efficient.
             // This case is handled by SEQTraversalFlowControlNode::Backprop().
@@ -70,6 +106,9 @@ void ComputationNode<ElemType>::Backprop(const FrameRange& fr, bool childrenInTh
                 LogicError("Backprop: Inefficiency: %ls %ls operation in loop propagates gradient to non-loop %ls %ls\n",
                            NodeName().c_str(), OperationName().c_str(), child->NodeName().c_str(), child->OperationName().c_str());
             }
+
+            // before backprop, verify gradient optimization info
+            SMART_NODE_INVOKE(ComputationNode, child, VerifyGradientOptimization, this);
 
             // fprintf(stderr, "BackpropTo %d %d %ls %ls\n", (int)fr.timeIdxInSeq, (int)i, NodeName().c_str(), OperationName().c_str());
             BackpropTo(i, fr); // this computes partial wrt to the child and sums the gradient value in the child
@@ -89,8 +128,9 @@ template<class ElemType>
                                                                   const MBLayoutPtr& layout,
                                                                   const std::shared_ptr<Matrix<ElemType>>& unpackedDataStorage,
                                                                   const std::shared_ptr<Matrix<ElemType>>& tempIndicesStorage,
+                                                                  const std::shared_ptr<Matrix<char>>& tempMaskStorage,
                                                                   bool batchMajor,
-                                                                  bool maskGaps)
+                                                                  const ElemType* gapPadValue)
 {
     size_t maxNumTimeSteps = 1;
     size_t numSequences = 1;
@@ -108,11 +148,8 @@ template<class ElemType>
     if ((maxNumTimeSteps == 1) || (numSequences == 1) || (batchMajor && (layout->GetNumParallelSequences() == layout->GetNumSequences())))
     {
         unpackedData = std::make_shared<Matrix<ElemType>>(packedData.AsReference());
-
-        if (maskGaps && layout && layout->HasGaps())
-        {
-            MaskMissingColumnsTo<ElemType>(*unpackedData, layout, FrameRange(layout), 0);
-        }
+        if (gapPadValue && layout && layout->HasGaps())
+            MaskMissingColumnsTo<ElemType>(*unpackedData, layout, FrameRange(layout), *gapPadValue);
     }
     else
     {
@@ -120,16 +157,18 @@ template<class ElemType>
         if (!unpackedData)
             unpackedData = std::make_shared<Matrix<ElemType>>(packedData.GetNumRows(), maxNumTimeSteps * numSequences, packedData.GetDeviceId(), packedData.GetMatrixType(), packedData.GetFormat());
         else
+        {
+            unpackedData->SwitchToMatrixType(packedData.GetMatrixType(), packedData.GetFormat(), /*keepValues=*/false);
             unpackedData->Resize(packedData.GetNumRows(), maxNumTimeSteps * numSequences);
-
-        if (maskGaps)
-            unpackedData->SetValue(0.0f);
+        }
 
         size_t i = 0;
         auto& layoutSequences = layout->GetAllSequences();
         int numLayoutSequences = (int)layoutSequences.size();
         std::vector<ElemType> scatterIndicesVector(layout->GetNumCols(), -1);
-
+        std::vector<char> columnsValidityMask;
+        if (gapPadValue)
+            columnsValidityMask.resize(numSequences * maxNumTimeSteps, 1);
         for (int layoutSequenceIdx = 0; layoutSequenceIdx < numLayoutSequences; ++layoutSequenceIdx)
         {
             auto sequenceInfo = layoutSequences[layoutSequenceIdx];
@@ -140,10 +179,16 @@ template<class ElemType>
                 auto currentSequenceEndIdx = std::min(maxNumTimeSteps, sequenceInfo.tEnd);
                 size_t currentSequenceLength = (currentSequenceEndIdx - currentSequenceBeginIdx);
 
-                for (size_t j = 0; j < currentSequenceLength; ++j)
+                for (size_t j = 0; j < maxNumTimeSteps; ++j)
                 {
-                    auto targetIdx = (ElemType)(batchMajor ? ((j * numSequences) + i) : ((i * maxNumTimeSteps) + j));
-                    scatterIndicesVector[((currentSequenceBeginIdx + j) * layout->GetNumParallelSequences()) + targetParallelStreamIdx] = targetIdx;
+                    auto targetIdx = (batchMajor ? ((j * numSequences) + i) : ((i * maxNumTimeSteps) + j));
+                    if (j < currentSequenceLength)
+                        scatterIndicesVector[((currentSequenceBeginIdx + j) * layout->GetNumParallelSequences()) + targetParallelStreamIdx] = (ElemType)targetIdx;
+                    else
+                    {
+                        if (gapPadValue)
+                            columnsValidityMask[targetIdx] = 0;
+                    }
                 }
 
                 i++;
@@ -156,7 +201,24 @@ template<class ElemType>
         else
             scatterIdxMatrix->SetValue(1, layout->GetNumCols(), packedData.GetDeviceId(), scatterIndicesVector.data());
 
+        // DoScatterColumnsOf for sparse matrices requires the output to be pre-fileed with 0s
+        if (gapPadValue && (*gapPadValue == 0) && (unpackedData->GetMatrixType() == MatrixType::SPARSE))
+            unpackedData->SetValue(*gapPadValue);
+
         unpackedData->DoScatterColumnsOf(0, *scatterIdxMatrix, packedData, 1);
+
+        // DoScatterColumnsOf fills the target with 0 before scattering if passed beta == 0. 
+        // This we need to mask only if the gapPadValue != 0
+        if (gapPadValue && (*gapPadValue != 0))
+        {
+            auto columnsValidityMaskMatrix = tempMaskStorage;
+            if (!columnsValidityMaskMatrix)
+                columnsValidityMaskMatrix = std::make_shared<Matrix<char>>(1, columnsValidityMask.size(), columnsValidityMask.data(), packedData.GetDeviceId());
+            else
+                columnsValidityMaskMatrix->SetValue(1, columnsValidityMask.size(), packedData.GetDeviceId(), columnsValidityMask.data());
+
+            unpackedData->MaskColumnsValue(*columnsValidityMaskMatrix, *gapPadValue, unpackedData->GetNumCols() / columnsValidityMaskMatrix->GetNumCols());
+        }
     }
 
     return TensorView<ElemType>(unpackedData, unpackedShape);
@@ -213,7 +275,6 @@ template<class ElemType>
 
 /*static*/ const std::wstring ComputationNodeBase::DefaultDynamicAxisName = L"*";
 /*static*/ const std::wstring ComputationNodeBase::DefaultNoSequenceAxisName = L"__noSequenceAxis";
-
 
 // -----------------------------------------------------------------------
 // subroutines for Validate() implementations
@@ -390,12 +451,12 @@ void ComputationNodeBase::ValidateNaryZip(bool isFinalValidationPass, bool allow
 }
 
 // unary reduce-to-(1,1) operation, e.g. MatrixL1RegNode
-void ComputationNodeBase::ValidateUnaryReduce(bool isFinalValidationPass)
+void ComputationNodeBase::ValidateUnaryReduce(bool isFinalValidationPass, bool keepDimensions)
 {
     assert(m_inputs.size() == 1);
     ComputationNodeBase::Validate(isFinalValidationPass);
     m_pMBLayout = nullptr; // this node does not hold mini-batch data
-    SetDims(TensorShape(1), false);
+    SetDims(keepDimensions ? m_inputs[0]->GetSampleLayout() : (TensorShape::Scalar(Environment().IsV2Library())), false);
 }
 
 // binary reduce-to-(1,1) operation, e.g. CrossEntropyWithSoftmaxNode
@@ -423,7 +484,7 @@ void ComputationNodeBase::ValidateBinaryReduce(bool isFinalValidationPass)
             LogicError("%ls: Expected MBLayout in Input 1.", NodeDescription().c_str());
         // Shape of the MBLayouts is checked at runtime.
     }
-    SetDims(TensorShape(1), false);
+    SetDims(TensorShape::Scalar(Environment().IsV2Library()), false);
 }
 
 // helper function for validation
@@ -618,8 +679,11 @@ template <class ElemType>
 {
     Base::BeginForwardProp();
 
+    if (NeedsDynamicValidation())
+        Validate(/*isFinalValidationPass =*/ true);
+
     // update the actual m_value allocation
-    if (!IsLeaf() && !RequiresPreCompute()) // TODO: guard this through overrides instead
+    if ((!IsLeaf() || Is<RandomDistributionNode<ElemType>>()) && !RequiresPreCompute()) // TODO: guard this through overrides instead
         UpdateFunctionValuesSize();
 
     // give nodes a chance to update their internal state that may also have to match MB size
@@ -638,9 +702,8 @@ template <class ElemType>
     {
         MaskMissingValueColumnsToZero(FrameRange(m_pMBLayout)); // HasNaN() operates on a whole matrix, so first flatten all gaps to 0
         if (Value().HasNan("EndForwardProp"))
-        {
             LogicError("%ls %ls operation unexpectedly produced NaN values.", NodeName().c_str(), OperationName().c_str());
-        }
+
         InvalidateMissingValueColumns(FrameRange(m_pMBLayout)); // blast NaNs into columns that are gaps in a packed layout
     }
 
@@ -690,13 +753,16 @@ template <class ElemType>
     {
         for (size_t i = 0; i < m_inputs.size(); i++)
         {
-            ComputationNodePtr child = Input(i);
-            if (child->m_needsGradient)
+            ComputationNodeBasePtr child = m_inputs[i];
+            if (child->NeedsGradient())
             {
-                child->MaskMissingGradientColumnsToZero(FrameRange(child->GetMBLayout())); // HasNaN() operates on a whole matrix, so first flatten all gaps to 0
-                if (child->Gradient().HasNan("EndBackprop"))
+                SMART_NODE_INVOKE(ComputationNode, child, MaskMissingGradientColumnsToZero, FrameRange(child->GetMBLayout())); // HasNaN() operates on a whole matrix, so first flatten all gaps to 0
+
+                bool hasNan = false;
+                SMART_NODE_INVOKE_WITH_RET(ComputationNode, child, Gradient().HasNan, hasNan, "EndBackprop");
+                if (hasNan)
                 {
-                    LogicError("%ls %ls operation unexpectedly produced NaN gradients.", child->NodeName().c_str(), child->OperationName().c_str());
+                    LogicError("%ls %ls operation unexpectedly produced NaN gradients on its input %ls.", NodeName().c_str(), OperationName().c_str(), child->NodeName().c_str());
                 }
             }
         }
@@ -769,6 +835,8 @@ void ComputationNode<ElemType>::WriteMinibatchWithFormatting(FILE* f,
     bool sampleSeparatorHasShape  = sampleSeparator.find("%x")  != sampleSeparator.npos;
     bool sequencePrologueHasSeqId = sequencePrologue.find("%d") != sequencePrologue.npos;
     bool sampleSeparatorHasSeqId  = sampleSeparator.find("%d")  != sampleSeparator.npos;
+    bool sequencePrologueHasSeqKey = sequencePrologue.find("%k") != sequencePrologue.npos;
+    bool sampleSeparatorHasSeqKey = sampleSeparator.find("%k") != sampleSeparator.npos;
 
     for (size_t s = 0; s < sequences.size(); s++)
     {
@@ -818,10 +886,17 @@ void ComputationNode<ElemType>::WriteMinibatchWithFormatting(FILE* f,
                 sampleSep = msra::strfun::ReplaceAll<std::string>(sampleSep, "%d", sh);
         }
 
+        if (getKeyById)
+        {
+            if (sequencePrologueHasSeqKey)
+                seqProl = msra::strfun::ReplaceAll<std::string>(seqProl, "%k", getKeyById(seqInfo.seqId));
+            if (sampleSeparatorHasSeqKey)
+                sampleSep = msra::strfun::ReplaceAll<std::string>(sampleSep, "%k", getKeyById(seqInfo.seqId));
+        }
+
         if (s > 0)
             fprintfOrDie(f, "%s", sequenceSeparator.c_str());
-        if (getKeyById)
-            fprintfOrDie(f, "%s ", getKeyById(seqInfo.seqId).c_str());
+
         fprintfOrDie(f, "%s", seqProl.c_str());
 
         // output it according to our format specification
@@ -932,7 +1007,7 @@ void ComputationNode<ElemType>::WriteMinibatchWithFormatting(FILE* f,
                     double absSumLocal = 0;
                     for (size_t j = 0; j < jend; j++) // loop over elements
                     {
-                        absSumLocal += abs(seqData[i * istride + j * jstride]);
+                        absSumLocal += (double)abs(seqData[i * istride + j * jstride]);
                     }
                     absSum += absSumLocal;
                 }
@@ -1064,6 +1139,7 @@ atomic_ullong TimeStamp::s_timeStampCounter = ATOMIC_VAR_INIT(0);
 
 template <> map<size_t, map<size_t, shared_ptr<SingleMatrix>>> ComputationNode<float>::s_constOnes{};
 template <> map<size_t, map<size_t, shared_ptr<DoubleMatrix>>> ComputationNode<double>::s_constOnes{};
+template <> map<size_t, map<size_t, shared_ptr<HalfMatrix>>> ComputationNode<half>::s_constOnes{};
 
 // -----------------------------------------------------------------------
 // instantiate the core class templates
@@ -1071,6 +1147,7 @@ template <> map<size_t, map<size_t, shared_ptr<DoubleMatrix>>> ComputationNode<d
 
 template class ComputationNode<float>;
 template class ComputationNode<double>;
+template class ComputationNode<half>;
 
 }}}
 

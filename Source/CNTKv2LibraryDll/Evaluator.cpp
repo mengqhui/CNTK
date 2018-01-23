@@ -6,7 +6,6 @@
 #include "stdafx.h"
 #include "CNTKLibrary.h"
 #include "Utils.h"
-#include "PerformanceProfiler.h"
 
 namespace CNTK
 {
@@ -37,7 +36,7 @@ namespace CNTK
 
         if (!m_evaluationFunction->Output().DynamicAxes().empty())
         {
-            m_aggregatedEvaluationFunction = ReduceSum(m_evaluationFunction, L"aggregateEvalMetric");
+            m_aggregatedEvaluationFunction = ReduceSum(m_evaluationFunction, Axis::AllAxes(), L"aggregateEvalMetric");
             m_testSampleCountVar = m_evaluationFunction;
         }
         else
@@ -45,7 +44,7 @@ namespace CNTK
             m_aggregatedEvaluationFunction = m_evaluationFunction;
             m_testSampleCountVar = m_evaluationFunction->RootFunction()->Inputs()[0];
         }
-
+        
         if(initializeCombined)
             m_combinedEvalFunction = Combine(GetCombinedEvalFunctionArgs());
     }
@@ -87,27 +86,27 @@ namespace CNTK
         return inputs;
     }
 
-    double Evaluator::TestMinibatch(const std::unordered_map<Variable, MinibatchData>& arguments, const DeviceDescriptor& computeDevice /*= DeviceDescriptor::UseDefaultDevice()*/)
+    double Evaluator::TestMinibatch(const std::unordered_map<Variable, MinibatchData>& arguments, const DeviceDescriptor& computeDevice /*= DeviceDescriptor::UseDefaultDevice()*/, bool distributed /*= false*/)
     {
         std::unordered_map<Variable, ValuePtr> outputsToFetch = {};
-        return TestMinibatch(GetInputs(arguments), outputsToFetch, computeDevice);
+        return TestMinibatch(GetInputs(arguments), outputsToFetch, computeDevice, distributed);
     }
 
-    double Evaluator::TestMinibatch(const std::unordered_map<Variable, ValuePtr>& arguments, const DeviceDescriptor& computeDevice /*= DeviceDescriptor::UseDefaultDevice()*/)
+    double Evaluator::TestMinibatch(const std::unordered_map<Variable, ValuePtr>& arguments, const DeviceDescriptor& computeDevice /*= DeviceDescriptor::UseDefaultDevice()*/, bool distributed /*= false*/)
     {
         std::unordered_map<Variable, ValuePtr> outputsToFetch = {};
-        return TestMinibatch(arguments, outputsToFetch, computeDevice);
+        return TestMinibatch(arguments, outputsToFetch, computeDevice, distributed);
     }
 
-    double Evaluator::TestMinibatch(const std::unordered_map<Variable, MinibatchData>& arguments, std::unordered_map<Variable, ValuePtr>& outputsToFetch, const DeviceDescriptor& computeDevice)
+    double Evaluator::TestMinibatch(const std::unordered_map<Variable, MinibatchData>& arguments, std::unordered_map<Variable, ValuePtr>& outputsToFetch, const DeviceDescriptor& computeDevice, bool distributed /*= false*/)
     {
-        return TestMinibatch(GetInputs(arguments), outputsToFetch, computeDevice);
+        return TestMinibatch(GetInputs(arguments), outputsToFetch, computeDevice, distributed);
     }
 
-    double Evaluator::TestMinibatch(const std::unordered_map<Variable, ValuePtr>& arguments, std::unordered_map<Variable, ValuePtr>& outputsToFetch, const DeviceDescriptor& computeDevice)
+    double Evaluator::TestMinibatch(const std::unordered_map<Variable, ValuePtr>& arguments, std::unordered_map<Variable, ValuePtr>& outputsToFetch, const DeviceDescriptor& computeDevice, bool distributed /*= false*/)
     {
         std::pair<ValuePtr, size_t> evalMinibatchValue;
-        TestMinibatch(arguments, outputsToFetch, evalMinibatchValue, computeDevice, false);
+        TestMinibatch(arguments, outputsToFetch, evalMinibatchValue, computeDevice, distributed);
         return evalMinibatchValue.first->AsScalar<double>() / evalMinibatchValue.second;
     }
 
@@ -127,9 +126,12 @@ namespace CNTK
 
             double localSampleCount = static_cast<double>(result.second);
 
-            auto values = std::vector<NDArrayViewPtr>{ result.first->Data(), MakeSharedObject<NDArrayView>(NDShape{ 1 }, &localSampleCount, 1, DeviceDescriptor::CPUDevice()) };
-            DistributedCommunicatorPtr communicator = MPICommunicator();
-            communicator->AggregateInPlace(values, communicator->Workers());
+            auto values = std::vector<NDArrayViewPtr>{ result.first->Data(), MakeSharedObject<NDArrayView>(NDShape{}, &localSampleCount, 1, DeviceDescriptor::CPUDevice()) };
+            if (!m_communicator)
+                m_communicator = MPICommunicator();
+
+            m_communicator->AggregateInPlace(values, m_communicator->Workers());
+
             result.second = static_cast<size_t>(localSampleCount);
         }
 

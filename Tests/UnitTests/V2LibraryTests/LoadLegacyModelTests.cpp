@@ -18,7 +18,7 @@ void TestLoadLegacyModelWithPrecompute(const DeviceDescriptor& device)
     const size_t baseFeaturesDim = 363;
     const size_t numOutputClasses = 132;
 
-    auto modelFuncPtr = Function::LoadModel(L"cntkSpeechFF.dnn", device);
+    auto modelFuncPtr = Function::Load(L"cntkSpeechFF.dnn", device);
 
     auto FindVariableByName = [](const std::vector<Variable>& variables, const std::wstring& name) {
         for (size_t i = 0; i < variables.size(); ++i)
@@ -48,8 +48,8 @@ void TestLoadLegacyModelWithPrecompute(const DeviceDescriptor& device)
     auto featureStreamInfo = minibatchSource->StreamInfo(L"features");
     auto labelStreamInfo = minibatchSource->StreamInfo(L"labels");
 
-    LearningRatePerSampleSchedule learningRatePerSample = 0.000781;
-    MomentumAsTimeConstantSchedule momentumTimeConstant = 6074;
+    LearningRateSchedule learningRatePerSample = LearningRateSchedule(0.000781, 1);
+    MomentumSchedule momentumTimeConstant = MomentumAsTimeConstantSchedule(6074);
     auto learner = MomentumSGDLearner(prediction->Parameters(), learningRatePerSample, momentumTimeConstant, /*unitGainMomentum = */true);
     auto trainer = CreateTrainer(prediction, loss, eval, { learner });
 
